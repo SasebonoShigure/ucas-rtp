@@ -874,9 +874,22 @@ int Rtp::recv_file(const char *filename)
     return 0;
 }
 
+#include "rtp.h"
+#include "util.h"
+// ... (您代码的其他部分，从头文件到 recv_file 函数都保持不变) ...
+
+/* 
+* 以下是您原始代码中从 send_file_sr() 开始的部分
+* 我将直接替换 send_file_sr() 和 recv_file_sr() 的实现
+* 并标注出修改。
+*/
+
 /* SR方式发送数量为total_packets的包，从data_map里取
  * 成功返回0，超时（5秒没收到任何包）返回1，失败返回-1
- * SR的ACK为确认收到的DAT包的编号 */
+ * 
+ * === MODIFIED: 本函数现在实现带有累积确认的滑动窗口协议 (类似GBN/TCP) ===
+ * ACK为累积确认，确认收到的连续包的最大编号。
+ */
 int Rtp::send_file_sr(uint32_t total_packets)
 {
     if (total_packets == 0)
@@ -889,7 +902,13 @@ int Rtp::send_file_sr(uint32_t total_packets)
     int64_t next_seq_num = this->seq_num + 1;
     int64_t highest_seq = this->seq_num + total_packets;
     LOG_DEBUG("send_file_sr: Starting to send %u packets from seq %ld to %ld\n", total_packets, base, highest_seq);
-    map<int64_t, chrono::steady_clock::time_point> unacked_packets; // <seq, send_time>
+    
+    // === MODIFIED START: 删除了 unacked_packets map ===
+    // 我们不再需要跟踪每个包的发送时间，而是只关心窗口的 base。
+    // map<int64_t, chrono::steady_clock::time_point> unacked_packets; 
+    chrono::steady_clock::time_point base_send_time; // 计时器只针对base
+    // === MODIFIED END ===
+
     this->last_recv_time = chrono::steady_clock::now();             // Initialize last receive time
 
     while (base <= highest_seq)
@@ -911,37 +930,40 @@ int Rtp::send_file_sr(uint32_t total_packets)
                     LOG_DEBUG("send_file_sr: Failed to send packet %ld\n", next_seq_num);
                     return -1;
                 }
-                unacked_packets[next_seq_num] = chrono::steady_clock::now();
+                
+                // === MODIFIED START: 更新base的发送时间 ===
+                if (next_seq_num == base) {
+                    base_send_time = chrono::steady_clock::now();
+                }
+                // === MODIFIED END ===
+
                 LOG_DEBUG("send_file_sr: Sent packet %ld. cwnd=%.1f, ssthresh=%.1f\n", next_seq_num, cwnd, ssthresh);
                 next_seq_num++;
             }
         }
         LOG_DEBUG("send_file_sr: Window [%ld, %ld), cwnd=%.1f, ssthresh=%.1f\n", base, next_seq_num, cwnd, ssthresh);
 
-        // Check for retransmission due to timeout
-        for (auto const &[seq, send_time] : unacked_packets)
-        {
-            if (chrono::steady_clock::now() - send_time > chrono::milliseconds(200))
-            { // 200ms RTO
-                auto it = this->data_map.find(seq);
-                if (it != this->data_map.end())
-                {
-                    if (send_packet(it->second) == -1)
-                    {
-                        return -1;
-                    }
-                    LOG_DEBUG("send_file_sr: TIMEOUT retransmit packet %ld\n", seq);
-                    unacked_packets[seq] = chrono::steady_clock::now(); // Update send time
-
-                    // === NEW: TCP Reno-style timeout reaction ===
-                    ssthresh = max(cwnd / 2.0, 2.0);
-                    cwnd = 1.0;
-                    dup_ack_count = 0;
-                    in_fast_recovery = false;
-                    LOG_DEBUG("send_file_sr: Timeout event. ssthresh=%.1f, cwnd=%.1f\n", ssthresh, cwnd);
+        // === MODIFIED START: 超时重传逻辑修改为只检查 base ===
+        // Check for retransmission due to timeout for the base of the window
+        if (chrono::steady_clock::now() - base_send_time > chrono::milliseconds(200)) { // 200ms RTO
+            auto it = this->data_map.find(base);
+            if (it != this->data_map.end()) {
+                if (send_packet(it->second) == -1) {
+                    return -1;
                 }
+                LOG_DEBUG("send_file_sr: TIMEOUT retransmit packet %ld (base of window)\n", base);
+                base_send_time = chrono::steady_clock::now(); // Reset timer for the base
+
+                // TCP Reno-style timeout reaction
+                ssthresh = max(cwnd / 2.0, 2.0);
+                cwnd = 1.0;
+                dup_ack_count = 0;
+                in_fast_recovery = false;
+                LOG_DEBUG("send_file_sr: Timeout event. ssthresh=%.1f, cwnd=%.1f\n", ssthresh, cwnd);
             }
         }
+        // === MODIFIED END ===
+
 
         // Wait for ACKs
         RtpHeader ack_header;
@@ -952,84 +974,74 @@ int Rtp::send_file_sr(uint32_t total_packets)
             this->last_recv_time = chrono::steady_clock::now();
             int64_t ack_seq = seq32to64(ack_header.seq_num);
 
-            if (ack_seq < base)
-            { // Old, duplicate ACK
-                LOG_DEBUG("send_file_sr: Received old ACK %ld, ignoring.\n", ack_seq);
-                continue;
-            }
-
-            if (ack_seq == last_ack_seq)
-            {
-                // === NEW: Fast Retransmit Logic ===
-                if (!in_fast_recovery)
-                {
-                    dup_ack_count++;
-                }
-                LOG_DEBUG("send_file_sr: Received duplicate ACK %ld (count=%d)\n", ack_seq, dup_ack_count + 1);
-
-                if (dup_ack_count == 3)
-                {
-                    LOG_DEBUG("send_file_sr: 3 duplicate ACKs for %ld. Triggering Fast Retransmit.\n", ack_seq);
-                    auto it = this->data_map.find(ack_seq);
-                    if (it != this->data_map.end())
-                    {
-                        send_packet(it->second); // Retransmit missing packet
-                        unacked_packets[ack_seq] = chrono::steady_clock::now();
-
-                        // === NEW: Fast Recovery (NewReno) entry ===
-                        in_fast_recovery = true;
-                        ssthresh = max(cwnd / 2.0, 2.0);
-                        cwnd = ssthresh + 3; // Inflate cwnd
-                        LOG_DEBUG("send_file_sr: Entering Fast Recovery. ssthresh=%.1f, cwnd=%.1f\n", ssthresh, cwnd);
-                    }
-                }
-                else if (in_fast_recovery)
-                {
-                    // In Fast Recovery, each duplicate ACK means a packet has left the network
-                    cwnd += 1.0;
-                    LOG_DEBUG("send_file_sr: In Fast Recovery, inflating cwnd to %.1f\n", cwnd);
-                }
-            }
-            else
-            { // New ACK
-                LOG_DEBUG("send_file_sr: Received new ACK %ld\n", ack_seq);
-                unacked_packets.erase(ack_seq);
+            // === MODIFIED START: ACK处理逻辑完全重写为累积确认 ===
+            
+            // ack_seq 是接收方已经收到的连续包的最大序号
+            // 所以我们期望的下一个包是 ack_seq + 1
+            if (ack_seq + 1 > base) { 
+                // 这是个新的有效ACK，可以滑动窗口
+                LOG_DEBUG("send_file_sr: Received new cumulative ACK for %ld. Window base was %ld\n", ack_seq, base);
+                base = ack_seq + 1; // 滑动窗口
                 last_ack_seq = ack_seq;
 
-                if (in_fast_recovery)
-                {
-                    // === NEW: Exit Fast Recovery (NewReno) ===
+                if (base < next_seq_num) {
+                    // 如果窗口中还有未确认的包，重置base的计时器
+                    base_send_time = chrono::steady_clock::now();
+                }
+
+                if (in_fast_recovery) {
+                    // 收到新ACK，退出快速恢复
                     cwnd = ssthresh;
                     in_fast_recovery = false;
                     dup_ack_count = 0;
                     LOG_DEBUG("send_file_sr: Exiting Fast Recovery. cwnd set to ssthresh %.1f\n", cwnd);
-                }
-                else
-                {
-                    // === NEW: Slow Start & Congestion Avoidance ===
-                    if (cwnd < ssthresh)
-                    {
+                } else {
+                    // 正常拥塞控制
+                    if (cwnd < ssthresh) {
                         // Slow Start: exponential growth
                         cwnd += 1.0;
                         LOG_DEBUG("send_file_sr: Slow Start, cwnd increased to %.1f\n", cwnd);
-                    }
-                    else
-                    {
+                    } else {
                         // Congestion Avoidance: linear growth
                         cwnd += (1.0 / cwnd);
                         LOG_DEBUG("send_file_sr: Congestion Avoidance, cwnd increased to %.1f\n", cwnd);
                     }
                 }
-                dup_ack_count = 0;
-            }
+                dup_ack_count = 0; // 重置重复ACK计数
 
-            // Slide the window base
-            while (unacked_packets.find(base) == unacked_packets.end() && base <= highest_seq)
-            {
-                base++;
+            } else if (ack_seq + 1 == base) { 
+                // 这是个重复的ACK (ack_seq == last_ack_seq)
+                if (!in_fast_recovery) {
+                    dup_ack_count++;
+                }
+                LOG_DEBUG("send_file_sr: Received duplicate ACK for %ld (count=%d)\n", ack_seq, dup_ack_count);
+
+                if (dup_ack_count == 3) {
+                    // 触发快速重传
+                    LOG_DEBUG("send_file_sr: 3 duplicate ACKs for %ld. Triggering Fast Retransmit for %ld.\n", ack_seq, base);
+                    auto it = this->data_map.find(base); // 重传 base, 因为 base 是期望收到的包
+                    if (it != this->data_map.end()) {
+                        send_packet(it->second); // Retransmit missing packet
+                        base_send_time = chrono::steady_clock::now();
+
+                        // 进入快速恢复 (Fast Recovery)
+                        in_fast_recovery = true;
+                        ssthresh = max(cwnd / 2.0, 2.0);
+                        cwnd = ssthresh + 3; // 窗口膨胀
+                        LOG_DEBUG("send_file_sr: Entering Fast Recovery. ssthresh=%.1f, cwnd=%.1f\n", ssthresh, cwnd);
+                    }
+                } else if (in_fast_recovery) {
+                    // 在快速恢复状态下，每个重复ACK表示一个包离开了网络
+                    cwnd += 1.0;
+                    LOG_DEBUG("send_file_sr: In Fast Recovery, inflating cwnd to %.1f\n", cwnd);
+                }
+            } else {
+                 // ack_seq + 1 < base, 这是一个过时的ACK，忽略
+                 LOG_DEBUG("send_file_sr: Received old cumulative ACK for %ld, ignoring.\n", ack_seq);
             }
-            base = base < next_seq_num ? base : next_seq_num; // 有可能全部ack了
-            LOG_DEBUG("send_file_sr: Window base sliding to %ld\n", base);
+            // === MODIFIED END ===
+            
+            LOG_DEBUG("send_file_sr: Window base is now %ld\n", base);
         }
     }
     LOG_DEBUG("send_file_sr() success\n");
@@ -1038,19 +1050,25 @@ int Rtp::send_file_sr(uint32_t total_packets)
 
 /* SR方式接收包，放到data_map里
  * 成功（收到fin）返回0，超时（5秒没收到任何包）返回1，失败返回-1
- * SR的ACK为确认收到的DAT包的编号 */
+ * 
+ * === MODIFIED: 本函数现在实现累积确认的接收方逻辑 ===
+ * 只ACK连续收到的最大序号的包。
+ */
 int Rtp::recv_file_sr()
 {
-    int64_t recv_base = this->seq_num + 1;
-    set<int64_t> received_but_not_contiguous;
+    int64_t recv_base = this->seq_num + 1; // 这是我们期望收到的下一个包的序号
+    
+    // === MODIFIED START: 不再需要 set 来跟踪乱序包 ===
+    // data_map 本身就起到了缓存乱序包的作用
+    // set<int64_t> received_but_not_contiguous;
+    // === MODIFIED END ===
+
     this->last_recv_time = chrono::steady_clock::now(); // Initialize
 
     while (true)
     {
-        // === NEW: Global timeout ===
         if (chrono::steady_clock::now() - this->last_recv_time > chrono::seconds(10))
         {
-            // If FIN was already received, it's a success. Otherwise, timeout.
             if (this->fin_received && this->fin_seq > recv_base)
             {
                 LOG_DEBUG("recv_file_sr: FIN received and processed. Exiting successfully.\n");
@@ -1060,7 +1078,6 @@ int Rtp::recv_file_sr()
             return 1;
         }
 
-        // If a FIN packet has been received and all preceding data packets are accounted for
         if (this->fin_received && recv_base >= this->fin_seq)
         {
             LOG_DEBUG("recv_file_sr: All packets before FIN (seq %ld) have been received.\n", this->fin_seq);
@@ -1071,48 +1088,48 @@ int Rtp::recv_file_sr()
         if (!recv_pkt)
             return -1;
 
-        // Wait for any data packet
         int ret = waitfor_dat(recv_pkt, 200);
 
         if (ret == 0) // Received a data packet
         {
             this->last_recv_time = chrono::steady_clock::now();
             int64_t pkt_seq = seq32to64(recv_pkt->header.seq_num);
-            LOG_DEBUG("recv_file_sr: Received DAT with seq %ld. Current base is %ld.\n", pkt_seq, recv_base);
+            LOG_DEBUG("recv_file_sr: Received DAT with seq %ld. Expecting base %ld.\n", pkt_seq, recv_base);
 
-            if (pkt_seq >= recv_base)
+            // === MODIFIED START: 接收和ACK逻辑完全重写 ===
+
+            // 如果收到的包是期望的或未来的包，并且还没有被存储过，则存起来
+            if (pkt_seq >= recv_base && this->data_map.find(pkt_seq) == this->data_map.end())
             {
-                if (this->data_map.find(pkt_seq) == this->data_map.end())
-                {
-                    RtpPacket *stored_pkt = (RtpPacket *)malloc(sizeof(RtpPacket));
-                    memcpy(stored_pkt, recv_pkt, sizeof(RtpPacket));
-                    this->data_map.insert({pkt_seq, stored_pkt});
-                    LOG_DEBUG("recv_file_sr: Packet %ld stored.\n", pkt_seq);
-
-                    // Slide the window base if this was the expected packet
-                    if (pkt_seq == recv_base)
-                    {
-                        while (this->data_map.count(recv_base))
-                        {
-                            recv_base++;
-                        }
-                        LOG_DEBUG("recv_file_sr: Window base advanced to %ld.\n", recv_base);
-                    }
-                }
+                RtpPacket *stored_pkt = (RtpPacket *)malloc(sizeof(RtpPacket));
+                memcpy(stored_pkt, recv_pkt, sizeof(RtpPacket));
+                this->data_map.insert({pkt_seq, stored_pkt});
+                LOG_DEBUG("recv_file_sr: Packet %ld buffered.\n", pkt_seq);
             }
 
-            // Always send an ACK for the received packet (SR behavior)
+            // 检查是否可以滑动窗口
+            // 如果收到了期望的包，就向前移动recv_base
+            while (this->data_map.count(recv_base))
+            {
+                recv_base++;
+            }
+            LOG_DEBUG("recv_file_sr: Next expected packet is now %ld.\n", recv_base);
+            
+            // 发送累积ACK
+            // ACK的序号是 recv_base - 1, 表示这个序号以及之前的所有包都已收到
             RtpHeader ack_pkt;
-            // 收方的可用窗口设为UINT16_MAX，lab要求里并未提及需要考虑流量控制
             uint16_t available_window = UINT16_MAX;
-            header_wrapper(&ack_pkt, recv_pkt->header.seq_num, available_window, RTP_ACK);
+            uint32_t ack_seq_32 = seq64to32(recv_base - 1);
+            header_wrapper(&ack_pkt, ack_seq_32, available_window, RTP_ACK);
             if (send_packet(&ack_pkt) == -1)
             {
                 LOG_FATAL("recv_file_sr() failed to send ACK\n");
                 free(recv_pkt);
                 return -1;
             }
-            LOG_DEBUG("recv_file_sr: Sent ACK for %ld. Available window: %d\n", pkt_seq, available_window);
+            LOG_DEBUG("recv_file_sr: Sent cumulative ACK for %ld. (i.e., expecting %ld)\n", recv_base - 1, recv_base);
+
+            // === MODIFIED END ===
         }
         free(recv_pkt);
     }
