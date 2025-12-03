@@ -172,28 +172,30 @@ int Rtp::recv_packet(void *buffer)
 }
 
 /* 打包RtpPacket到pkt并计算checksum */
-void Rtp::packet_wrapper(RtpPacket *pkt, uint32_t seq_num, uint16_t length, void *payload)
+void Rtp::packet_wrapper(RtpPacket *pkt, uint32_t seq_num, uint16_t length, uint16_t advertised_window, void *payload)
 {
     memset(pkt, 0, sizeof(RtpPacket));
     pkt->header.seq_num = seq_num;
     pkt->header.length = length;
-    pkt->header.checksum = 0; // 先清零再计算checksum
+    pkt->header.checksum = 0;                          // 先清零再计算checksum
+    pkt->header.advertised_window = advertised_window; // Set advertised window
     pkt->header.flags = RTP_DAT;
     if (length > 0)
     {
         memcpy(pkt->payload, payload, length);
-        pkt->header.checksum = compute_checksum(pkt, pkt->header.length + sizeof(RtpHeader));
     }
+    pkt->header.checksum = compute_checksum(pkt, pkt->header.length + sizeof(RtpHeader));
 }
 
 /* 打包RtpHeader到header并计算checksum */
-void Rtp::header_wrapper(RtpHeader *header, uint32_t seq_num, uint8_t flags)
+void Rtp::header_wrapper(RtpHeader *header, uint32_t seq_num, uint16_t advertised_window, uint8_t flags)
 {
     memset(header, 0, sizeof(RtpHeader));
     header->seq_num = seq_num;
     header->length = 0;
-    header->checksum = 0; // 先清零再计算checksum
+    header->advertised_window = advertised_window; // Set advertised window
     header->flags = flags;
+    header->checksum = 0; // 先清零再计算checksum
     header->checksum = compute_checksum(header, sizeof(RtpHeader));
 }
 
@@ -278,7 +280,7 @@ int Rtp::connect(const struct sockaddr *addr, socklen_t addrlen)
     this->dest_addr = *(struct sockaddr_in *)addr;
     this->addrlen = addrlen;
     RtpHeader send_syn;
-    header_wrapper(&send_syn, seq_num, RTP_SYN);
+    header_wrapper(&send_syn, seq_num, this->window_size, RTP_SYN);
     if (send_packet((void *)&send_syn) == -1)
     {
         LOG_DEBUG("connect send syn failed\n");
@@ -339,7 +341,7 @@ int Rtp::connect(const struct sockaddr *addr, socklen_t addrlen)
 
     // 第三次握手
     RtpHeader send_ack;
-    header_wrapper(&send_ack, seq_num, RTP_ACK);
+    header_wrapper(&send_ack, seq_num, this->window_size, RTP_ACK);
     if (send_packet((void *)&send_ack) == -1)
     {
         LOG_DEBUG("connect send ack failed\n");
@@ -432,7 +434,7 @@ int Rtp::wait_connect()
     free(recv_syn);
     // 第二次握手，发送SYN&ACK
     RtpHeader send_syn_ack;
-    header_wrapper(&send_syn_ack, seq_num, RTP_SYN | RTP_ACK);
+    header_wrapper(&send_syn_ack, seq_num, this->window_size, RTP_SYN | RTP_ACK);
     if (send_packet((void *)&send_syn_ack) == -1)
     {
         LOG_DEBUG("wait_connect send syn_ack failed\n");
@@ -496,7 +498,7 @@ int Rtp::close()
     this->seq_num += 1;
     uint32_t seq_num = seq64to32(this->seq_num);
     RtpHeader send_fin;
-    header_wrapper(&send_fin, seq_num, RTP_FIN);
+    header_wrapper(&send_fin, seq_num, 0, RTP_FIN);
     if (send_packet((void *)&send_fin) == -1)
     {
         LOG_DEBUG("close send fin failed\n");
@@ -563,7 +565,7 @@ int Rtp::wait_close()
     if (this->fin_received)
     {
         RtpHeader send_fin_ack;
-        header_wrapper(&send_fin_ack, seq_num, RTP_FIN | RTP_ACK);
+        header_wrapper(&send_fin_ack, seq_num, 0, RTP_FIN | RTP_ACK);
         if (send_packet((void *)&send_fin_ack) == -1)
         {
             LOG_DEBUG("wait_close send fin_ack failed\n");
@@ -613,7 +615,7 @@ int Rtp::wait_close()
     // free(recv_fin);
     // 第二次挥手，发送FIN&ACK
     RtpHeader send_fin_ack;
-    header_wrapper(&send_fin_ack, seq_num, RTP_FIN | RTP_ACK);
+    header_wrapper(&send_fin_ack, seq_num, 0, RTP_FIN | RTP_ACK);
     if (send_packet((void *)&send_fin_ack) == -1)
     {
         LOG_DEBUG("wait_close send fin_ack failed\n");
@@ -756,17 +758,21 @@ int Rtp::waitfor_dat(void *buffer, int64_t begin, int64_t end, int timeout)
  * 结束时清空data_map */
 int Rtp::send_file(const char *filename)
 {
-    // 读取文件
     ifstream file(filename, ios::binary | ios::ate);
     if (!file.is_open())
     {
-        LOG_DEBUG("send_file() failed to open file\n");
+        LOG_FATAL("send_file() failed to open file\n");
         return -1;
     }
     uint32_t file_size = file.tellg();
-
     file.seekg(0, ios::beg);
     char *file_buffer = (char *)malloc(file_size);
+    if (!file_buffer)
+    {
+        LOG_FATAL("Failed to allocate buffer for file\n");
+        file.close();
+        return -1;
+    }
     file.read(file_buffer, file_size);
     file.close();
     // 计算文件总包数
@@ -775,21 +781,20 @@ int Rtp::send_file(const char *filename)
     for (uint32_t i = 0; i < total_packets; i++)
     {
         RtpPacket *pkt = (RtpPacket *)malloc(sizeof(RtpPacket)); // 在data_map被销毁时统一free
-        uint16_t length = i == total_packets - 1 ? file_size % PAYLOAD_MAX : PAYLOAD_MAX;
-        packet_wrapper(pkt, seq64to32(this->seq_num + 1 + i), length, file_buffer + i * PAYLOAD_MAX);
+        uint16_t length = (i == total_packets - 1 && file_size % PAYLOAD_MAX != 0) ? file_size % PAYLOAD_MAX : PAYLOAD_MAX;
+        packet_wrapper(pkt, seq64to32(this->seq_num + 1 + i), length, 0, file_buffer + i * PAYLOAD_MAX);
         this->data_map.insert(pair<int64_t, RtpPacket *>(this->seq_num + 1 + i, pkt));
     }
     free(file_buffer);
     // 发送
-    int ret;
-
-    LOG_DEBUG("send_file() using SR\n");
-    ret = send_file_sr(total_packets);
+    LOG_DEBUG("send_file() using SR with Congestion Control\n");
+    int ret = send_file_sr(total_packets);
 
     // 清空data_map
-    for (auto it = this->data_map.begin(); it != this->data_map.end(); it++)
+
+    for (auto const &[key, val] : this->data_map)
     {
-        free(it->second);
+        free(val);
     }
     this->data_map.clear();
     this->seq_num += total_packets; // 加上文件总字节数的包和文件数据包
@@ -802,19 +807,16 @@ int Rtp::send_file(const char *filename)
  * 结束时清空data_map */
 int Rtp::recv_file(const char *filename)
 {
-    // 接收
-    int ret;
-
     LOG_DEBUG("recv_file() using SR\n");
-    ret = recv_file_sr();
+    int ret = recv_file_sr();
 
     if (ret != 0)
     {
-        LOG_DEBUG("recv_file() failed\n");
+        LOG_DEBUG("recv_file() failed with code %d\n", ret);
         // 清空data_map
-        for (auto it = this->data_map.begin(); it != this->data_map.end(); it++)
+        for (auto const &[key, val] : this->data_map)
         {
-            free(it->second);
+            free(val);
         }
         this->data_map.clear();
         return ret;
@@ -824,30 +826,28 @@ int Rtp::recv_file(const char *filename)
     ofstream file(filename, ios::binary);
     if (!file.is_open())
     {
-        LOG_DEBUG("recv_file() failed to open file\n");
+        LOG_FATAL("recv_file() failed to open file\n");
         // 清空data_map
-        for (auto it = this->data_map.begin(); it != this->data_map.end(); it++)
+        for (auto const &[key, val] : this->data_map)
         {
-            free(it->second);
+            free(val);
         }
         this->data_map.clear();
-        this->seq_num += this->data_map.size();
         return -1;
     }
 
-    LOG_DEBUG("recv_file() received file with packets %ld, first packet seq_num:%ld\n", data_map.size(), data_map.begin()->first);
     // 从data_map里读取并写入文件
-    for (auto it = this->data_map.begin(); it != this->data_map.end(); it++)
-    {
 
-        file.write(it->second->payload, it->second->header.length);
+    for (auto const &[key, val] : this->data_map)
+    {
+        file.write(val->payload, val->header.length);
     }
     file.close();
     this->seq_num += this->data_map.size();
     // 清空data_map
-    for (auto it = this->data_map.begin(); it != this->data_map.end(); it++)
+    for (auto const &[key, val] : this->data_map)
     {
-        free(it->second);
+        free(val);
     }
     this->data_map.clear();
     return 0;
@@ -858,101 +858,157 @@ int Rtp::recv_file(const char *filename)
  * SR的ACK为确认收到的DAT包的编号 */
 int Rtp::send_file_sr(uint32_t total_packets)
 {
-    // 未确认的包，pair<时间戳，64位seq_num>
-    map<int64_t, chrono::_V2::steady_clock::time_point> unacked; // 未确认的包，确认的时候删掉
-    set<int64_t> acked;                                          // 已确认的包，为了性能，只记录窗口内的，更新窗口时需要更新
-    set<int64_t> unsend;                                         // 由于窗口移动下一次需要发送的包
-    int64_t window_base = this->seq_num + 1;                     // 窗口的第一个包
-    for (int64_t i = window_base; i < window_base + this->window_size && i < this->seq_num + 1 + total_packets; i++)
+    if (total_packets == 0)
     {
-        unsend.insert(i);
+        LOG_DEBUG("send_file_sr: No packets to send for empty file.\n");
+        return 0;
     }
-    while (window_base < this->seq_num + 1 + total_packets)
+
+    int64_t base = this->seq_num + 1;
+    int64_t next_seq_num = this->seq_num + 1;
+    int64_t highest_seq = this->seq_num + total_packets;
+    LOG_DEBUG("send_file_sr: Starting to send %u packets from seq %ld to %ld\n", total_packets, base, highest_seq);
+    map<int64_t, chrono::steady_clock::time_point> unacked_packets; // <seq, send_time>
+    this->last_recv_time = chrono::steady_clock::now();             // Initialize last receive time
+
+    while (base <= highest_seq)
     {
-        // 超时5秒没收到任何包
         if (chrono::steady_clock::now() - this->last_recv_time > chrono::seconds(5))
         {
-            LOG_DEBUG("send_file_sr() timeout\n");
-            return 1;
+            LOG_FATAL("send_file_sr: Connection timed out (5s no ACK).\n");
+            return 1; // Timeout
         }
-        // 发送超时未响应的包
-        for (auto it = unacked.begin(); it != unacked.end(); it++)
+
+        // Send new packets if allowed by congestion window
+        while (next_seq_num < base + this->cwnd && next_seq_num <= highest_seq)
         {
-            if (chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - it->second).count() > 100)
+            auto it = this->data_map.find(next_seq_num);
+            if (it != this->data_map.end())
             {
-                auto it2 = this->data_map.find(it->first);
-                if (it2 == this->data_map.end())
+                if (send_packet(it->second) == -1)
                 {
-                    LOG_DEBUG("send_file_sr() failed to find timeout packet %ld for resend\n", it->first);
+                    LOG_DEBUG("send_file_sr: Failed to send packet %ld\n", next_seq_num);
                     return -1;
                 }
-                if (send_packet(it2->second) == -1)
-                {
-                    LOG_DEBUG("send_file_sr() failed to resend timeout packet %ld\n", it->first);
-                    return -1;
-                }
-                // 重发后更新时间戳
-                it->second = chrono::steady_clock::now();
-                LOG_DEBUG("send_file_sr() Resent packet %ld\n", it->first);
+                unacked_packets[next_seq_num] = chrono::steady_clock::now();
+                LOG_DEBUG("send_file_sr: Sent packet %ld. cwnd=%.1f, ssthresh=%.1f\n", next_seq_num, cwnd, ssthresh);
+                next_seq_num++;
             }
         }
-        // 发送窗口内未发送的包
-        for (auto it = unsend.begin(); it != unsend.end();)
+        LOG_DEBUG("send_file_sr: Window [%ld, %ld), cwnd=%.1f, ssthresh=%.1f\n", base, next_seq_num, cwnd, ssthresh);
+
+        // Check for retransmission due to timeout
+        for (auto const &[seq, send_time] : unacked_packets)
         {
-            auto it2 = this->data_map.find(*it);
-            if (it2 == this->data_map.end())
-            {
-                LOG_DEBUG("send_file_sr() failed to find packet %ld\n", *it);
-                return -1;
+            if (chrono::steady_clock::now() - send_time > chrono::milliseconds(200))
+            { // 200ms RTO
+                auto it = this->data_map.find(seq);
+                if (it != this->data_map.end())
+                {
+                    if (send_packet(it->second) == -1)
+                    {
+                        return -1;
+                    }
+                    LOG_DEBUG("send_file_sr: TIMEOUT retransmit packet %ld\n", seq);
+                    unacked_packets[seq] = chrono::steady_clock::now(); // Update send time
+
+                    // === NEW: TCP Reno-style timeout reaction ===
+                    ssthresh = max(cwnd / 2.0, 2.0);
+                    cwnd = 1.0;
+                    dup_ack_count = 0;
+                    in_fast_recovery = false;
+                    LOG_DEBUG("send_file_sr: Timeout event. ssthresh=%.1f, cwnd=%.1f\n", ssthresh, cwnd);
+                }
             }
-            if (send_packet(it2->second) == -1)
-            {
-                LOG_DEBUG("send_file_sr() failed to send packet %ld\n", *it);
-                return -1;
-            }
-            unacked.insert(pair<int64_t, chrono::_V2::steady_clock::time_point>(*it, chrono::steady_clock::now()));
-            LOG_DEBUG("send_file_sr() Sent packet %ld\n", *it);
-            it = unsend.erase(it); // 返回的是下一个元素的迭代器
         }
-        // 等待ACK
-        int64_t ack_seq_num;
-        LOG_DEBUG("send_file_sr() waiting for ACK in range [%ld,%ld)\n", window_base, window_base + this->window_size);
-        int ret = waitfor_ack(&ack_seq_num, window_base, window_base + this->window_size, 100);
-        if (ret == 0) // 收到ACK
-        {
-            if (acked.find(ack_seq_num) == acked.end()) // 未收到过这个ACK
+
+        // Wait for ACKs
+        RtpHeader ack_header;
+        int wait_ret = waitfor(&ack_header, RTP_ACK, 50); // Wait for 50ms
+
+        if (wait_ret == 0)
+        { // Received an ACK
+            this->last_recv_time = chrono::steady_clock::now();
+            int64_t ack_seq = seq32to64(ack_header.seq_num);
+
+            if (ack_seq < base)
+            { // Old, duplicate ACK
+                LOG_DEBUG("send_file_sr: Received old ACK %ld, ignoring.\n", ack_seq);
+                continue;
+            }
+
+            if (ack_seq == last_ack_seq)
             {
-                acked.insert(ack_seq_num);
-                auto it = unacked.find(ack_seq_num);
-                if (it != unacked.end())
+                // === NEW: Fast Retransmit Logic ===
+                if (!in_fast_recovery)
                 {
-                    unacked.erase(it);
+                    dup_ack_count++;
                 }
-                // 移动窗口
-                while (acked.find(window_base) != acked.end())
+                LOG_DEBUG("send_file_sr: Received duplicate ACK %ld (count=%d)\n", ack_seq, dup_ack_count + 1);
+
+                if (dup_ack_count == 3)
                 {
-                    acked.erase(window_base);
-                    window_base++;
+                    LOG_DEBUG("send_file_sr: 3 duplicate ACKs for %ld. Triggering Fast Retransmit.\n", ack_seq);
+                    auto it = this->data_map.find(ack_seq);
+                    if (it != this->data_map.end())
+                    {
+                        send_packet(it->second); // Retransmit missing packet
+                        unacked_packets[ack_seq] = chrono::steady_clock::now();
+
+                        // === NEW: Fast Recovery (NewReno) entry ===
+                        in_fast_recovery = true;
+                        ssthresh = max(cwnd / 2.0, 2.0);
+                        cwnd = ssthresh + 3; // Inflate cwnd
+                        LOG_DEBUG("send_file_sr: Entering Fast Recovery. ssthresh=%.1f, cwnd=%.1f\n", ssthresh, cwnd);
+                    }
                 }
-                for (int64_t i = window_base; i < window_base + this->window_size && i < this->seq_num + 1 + total_packets; i++)
+                else if (in_fast_recovery)
                 {
-                    unsend.insert(i);
+                    // In Fast Recovery, each duplicate ACK means a packet has left the network
+                    cwnd += 1.0;
+                    LOG_DEBUG("send_file_sr: In Fast Recovery, inflating cwnd to %.1f\n", cwnd);
                 }
-                LOG_DEBUG("send_file_sr() Received ACK %ld, window updated to [%ld,%ld)\n", ack_seq_num, window_base, window_base + this->window_size);
             }
             else
-            {
-                LOG_DEBUG("send_file_sr() Received duplicate ACK %ld\n", ack_seq_num);
+            { // New ACK
+                LOG_DEBUG("send_file_sr: Received new ACK %ld\n", ack_seq);
+                unacked_packets.erase(ack_seq);
+                last_ack_seq = ack_seq;
+
+                if (in_fast_recovery)
+                {
+                    // === NEW: Exit Fast Recovery (NewReno) ===
+                    cwnd = ssthresh;
+                    in_fast_recovery = false;
+                    dup_ack_count = 0;
+                    LOG_DEBUG("send_file_sr: Exiting Fast Recovery. cwnd set to ssthresh %.1f\n", cwnd);
+                }
+                else
+                {
+                    // === NEW: Slow Start & Congestion Avoidance ===
+                    if (cwnd < ssthresh)
+                    {
+                        // Slow Start: exponential growth
+                        cwnd += 1.0;
+                        LOG_DEBUG("send_file_sr: Slow Start, cwnd increased to %.1f\n", cwnd);
+                    }
+                    else
+                    {
+                        // Congestion Avoidance: linear growth
+                        cwnd += (1.0 / cwnd);
+                        LOG_DEBUG("send_file_sr: Congestion Avoidance, cwnd increased to %.1f\n", cwnd);
+                    }
+                }
+                dup_ack_count = 0;
             }
-        }
-        else if (ret == 1) // 超时
-        {
-            continue;
-        }
-        else // waitfor错误
-        {
-            LOG_DEBUG("send_file_sr() waitfor() failed\n");
-            return -1;
+
+            // Slide the window base
+            while (unacked_packets.find(base) == unacked_packets.end() && base <= highest_seq)
+            {
+                base++;
+            }
+            base = base < next_seq_num ? base : next_seq_num; // 有可能全部ack了
+            LOG_DEBUG("send_file_sr: Window base sliding to %ld\n", base);
         }
     }
     LOG_DEBUG("send_file_sr() success\n");
@@ -964,74 +1020,82 @@ int Rtp::send_file_sr(uint32_t total_packets)
  * SR的ACK为确认收到的DAT包的编号 */
 int Rtp::recv_file_sr()
 {
-    int64_t window_base = this->seq_num + 1; // 窗口的第一个包
-    RtpPacket *recv_pkt = (RtpPacket *)malloc(sizeof(RtpPacket));
+    int64_t recv_base = this->seq_num + 1;
+    set<int64_t> received_but_not_contiguous;
+    this->last_recv_time = chrono::steady_clock::now(); // Initialize
+
     while (true)
     {
-        // 超时5秒没收到任何包
-        if (chrono::steady_clock::now() - this->last_recv_time > chrono::seconds(5))
+        // === NEW: Global timeout ===
+        if (chrono::steady_clock::now() - this->last_recv_time > chrono::seconds(10))
         {
-            LOG_DEBUG("recv_file_sr() timeout\n");
+            // If FIN was already received, it's a success. Otherwise, timeout.
+            if (this->fin_received && this->fin_seq > recv_base)
+            {
+                LOG_DEBUG("recv_file_sr: FIN received and processed. Exiting successfully.\n");
+                break;
+            }
+            LOG_FATAL("recv_file_sr: Connection timed out (10s no data).\n");
             return 1;
         }
-        // 如果收到过fin，结束
-        if (this->fin_received)
+
+        // If a FIN packet has been received and all preceding data packets are accounted for
+        if (this->fin_received && recv_base >= this->fin_seq)
         {
-            LOG_DEBUG("recv_file_sr() received FIN\n");
-            return 0;
+            LOG_DEBUG("recv_file_sr: All packets before FIN (seq %ld) have been received.\n", this->fin_seq);
+            break;
         }
-        // 等待[window_base - window_size, window_base + window_size)的数据包
-        LOG_DEBUG("recv_file_sr() waiting for DAT in range [%ld,%ld)\n", window_base - this->window_size, window_base + this->window_size);
-        
-        int ret = waitfor_dat(recv_pkt, window_base - this->window_size, window_base + this->window_size, 100);
-        if (ret == 0) // 收到包
+
+        RtpPacket *recv_pkt = (RtpPacket *)malloc(sizeof(RtpPacket));
+        if (!recv_pkt)
+            return -1;
+
+        // Wait for any data packet, not just in-window. We might need to ACK old packets.
+        int ret = waitfor_dat(recv_pkt, this->seq_num + 1, INT64_MAX, 200);
+
+        if (ret == 0) // Received a data packet
         {
-            //如果是在[window_base, window_base + window_size)范围内的包，放到data_map里
-            if (seq32to64( recv_pkt->header.seq_num) >= window_base)
+            this->last_recv_time = chrono::steady_clock::now();
+            int64_t pkt_seq = seq32to64(recv_pkt->header.seq_num);
+            LOG_DEBUG("recv_file_sr: Received DAT with seq %ld. Current base is %ld.\n", pkt_seq, recv_base);
+
+            // Check if packet is within the receive window [base, base + win_size)
+            if (pkt_seq >= recv_base && pkt_seq < recv_base + this->window_size)
             {
-                if (this->data_map.find(seq32to64(recv_pkt->header.seq_num)) == this->data_map.end())
+                if (this->data_map.find(pkt_seq) == this->data_map.end())
                 {
-                    RtpPacket *temp_pkt = (RtpPacket *)malloc(sizeof(RtpPacket));
-                    memcpy(temp_pkt, recv_pkt, sizeof(RtpPacket));
-                    this->data_map.insert(pair<int64_t, RtpPacket *>(seq32to64(recv_pkt->header.seq_num), temp_pkt));
-                    LOG_DEBUG("recv_file_sr() Received DAT %u, put into data_map\n", recv_pkt->header.seq_num);
+                    RtpPacket *stored_pkt = (RtpPacket *)malloc(sizeof(RtpPacket));
+                    memcpy(stored_pkt, recv_pkt, sizeof(RtpPacket));
+                    this->data_map.insert({pkt_seq, stored_pkt});
+                    LOG_DEBUG("recv_file_sr: Packet %ld stored.\n", pkt_seq);
+
+                    // Slide the window base if this was the expected packet
+                    if (pkt_seq == recv_base)
+                    {
+                        while (this->data_map.count(recv_base))
+                        {
+                            recv_base++;
+                        }
+                        LOG_DEBUG("recv_file_sr: Window base advanced to %ld.\n", recv_base);
+                    }
                 }
-                else
-                {
-                    LOG_DEBUG("recv_file_sr() Received duplicate DAT %u\n", recv_pkt->header.seq_num);
-                }
-                //更新窗口
-                while (this->data_map.find(window_base) != this->data_map.end())
-                {
-                    window_base++;
-                }
-                LOG_DEBUG("recv_file_sr() window updated to [%ld,%ld)\n", window_base, window_base + this->window_size);
             }
-            else
-            {
-                LOG_DEBUG("recv_file_sr() Received out of range DAT %u\n", recv_pkt->header.seq_num);
-            }
-            // 发送ACK
+
+            // Always send an ACK for the received packet (SR behavior)
             RtpHeader ack_pkt;
-            header_wrapper(&ack_pkt, recv_pkt->header.seq_num, RTP_ACK);
+            // 收方的可用窗口设为INT32_MAX，lab要求里并未提及需要考虑流量控制
+            uint16_t available_window = INT32_MAX;
+            header_wrapper(&ack_pkt, recv_pkt->header.seq_num, available_window, RTP_ACK);
             if (send_packet(&ack_pkt) == -1)
             {
-                LOG_DEBUG("recv_file_sr() failed to send ACK\n");
+                LOG_FATAL("recv_file_sr() failed to send ACK\n");
                 free(recv_pkt);
                 return -1;
             }
-            LOG_DEBUG("recv_file_sr() Sent ACK %u\n", recv_pkt->header.seq_num);
-
+            LOG_DEBUG("recv_file_sr: Sent ACK for %ld. Available window: %d\n", pkt_seq, available_window);
         }
-        else if (ret == 1) // 超时
-        {
-            continue;
-        }
-        else // waitfor错误
-        {
-            LOG_DEBUG("recv_file_sr() waitfor() failed\n");
-            free(recv_pkt);
-            return -1;
-        }
+        free(recv_pkt);
     }
+    LOG_DEBUG("recv_file_sr() success\n");
+    return 0;
 }

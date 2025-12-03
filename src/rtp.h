@@ -10,6 +10,8 @@
 #include <poll.h>
 #include <chrono>
 #include <map>
+#include <set>
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -29,10 +31,11 @@ extern "C"
     /* 根据文档，简便起见都采用小端法 */
     typedef struct __attribute__((__packed__)) RtpHeader
     {
-        uint32_t seq_num;  // Sequence number
-        uint16_t length;   // Length of data; 0 for SYN, ACK, and FIN packets
-        uint32_t checksum; // 32-bit CRC
-        uint8_t flags;     // See at `RtpHeaderFlag`
+        uint32_t seq_num;           // Sequence number
+        uint16_t length;            // Length of data; 0 for SYN, ACK, and FIN packets
+        uint32_t checksum;          // 32-bit CRC
+        uint16_t advertised_window; // Receiver's available window size **FLOW CONTROL NOT IMPLEMENTED**
+        uint8_t flags;              // See at `RtpHeaderFlag`
     } rtp_header_t;
 
 #ifdef __cplusplus
@@ -48,10 +51,17 @@ typedef struct __attribute__((__packed__)) RtpPacket
 class Rtp
 {
 private:
-    int sockfd;                                               // socket file descriptor
-    struct sockaddr_in dest_addr;                             // destination address
-    socklen_t addrlen = 0;                                    // length of dest_addr,连接关闭后记得清零
-    uint32_t window_size;                                     // window size
+    int sockfd;                   // socket file descriptor
+    struct sockaddr_in dest_addr; // destination address
+    socklen_t addrlen = 0;        // length of dest_addr,连接关闭后记得清零
+    uint32_t window_size;         // initial window size
+
+    double cwnd;           // Congestion window size
+    double ssthresh;       // Slow start threshold
+    int dup_ack_count;     // Duplicate ACK counter for fast retransmit
+    int64_t last_ack_seq;  // Last received ACK seq number
+    bool in_fast_recovery; // Flag for fast recovery state
+
     int64_t seq_num;                                          // 下一个功能模块发送/接收的第一个包的序号为这个值+1
     uint32_t seq_base;                                        // base of sequence number
     std::chrono::steady_clock::time_point last_recv_time;     // last time received a packet
@@ -73,7 +83,8 @@ private:
 
 public:
     Rtp(int sockfd, int window_size)
-        : sockfd(sockfd), window_size(window_size) {}
+        : sockfd(sockfd), window_size(window_size), cwnd(1.0), 
+          ssthresh(window_size), dup_ack_count(0), last_ack_seq(-1), in_fast_recovery(false) {}
     ~Rtp() {}
     int connect(const struct sockaddr *addr,
                 socklen_t addrlen); // connect to a remote host
@@ -81,11 +92,11 @@ public:
     int close();                    // close the connection
     int wait_close();               // wait for the connection to close
     static void packet_wrapper(RtpPacket *pkt, uint32_t seq_num,
-                               uint16_t length, void *payload); // wrap a packet
+                               uint16_t length, uint16_t advertised_window, void *payload); // wrap a packet
     static void header_wrapper(RtpHeader *header,
-                               uint32_t seq_num, uint8_t flags); // wrap a header
-    int send_file(const char *filename);                         // send a file
-    int recv_file(const char *filename);                         // receive a file
+                               uint32_t seq_num, uint16_t advertised_window, uint8_t flags); // wrap a header
+    int send_file(const char *filename);                                                     // send a file
+    int recv_file(const char *filename);                                                     // receive a file
 };
 
 #endif // __RTP_H
