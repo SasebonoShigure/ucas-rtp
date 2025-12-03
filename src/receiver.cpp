@@ -8,7 +8,6 @@ void receiver_routine(char **argv)
 {
     int port = atoi(argv[1]);
     char *file_path = argv[2];
-    int window_size = atoi(argv[3]);
     int sockfd;
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
     {
@@ -32,7 +31,7 @@ void receiver_routine(char **argv)
         close(sockfd);
     }
     LOG_DEBUG("RTP receiver is listening on port %d...\n", port);
-    Rtp rtp(sockfd, window_size);
+    Rtp rtp(sockfd);
     if (rtp.wait_connect() == -1)
     {
         close(sockfd);
@@ -56,9 +55,9 @@ void receiver_routine(char **argv)
 
 int main(int argc, char **argv)
 {
-    if (argc != 4)
+    if (argc != 3)
     {
-        LOG_FATAL("Usage: ./receiver [listen port] [file path] [window size] \n");
+        LOG_FATAL("Usage: ./receiver [listen port] [file path]\n");
     }
     // your code here
     receiver_routine(argv);

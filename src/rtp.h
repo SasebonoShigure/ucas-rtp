@@ -54,7 +54,6 @@ private:
     int sockfd;                   // socket file descriptor
     struct sockaddr_in dest_addr; // destination address
     socklen_t addrlen = 0;        // length of dest_addr,连接关闭后记得清零
-    uint32_t window_size;         // initial window size
 
     double cwnd;           // Congestion window size
     double ssthresh;       // Slow start threshold
@@ -77,14 +76,16 @@ private:
     /* 以下函数是在connect和close写完之后才加的，故在这两个函数中没有使用 */
     int waitfor_ack(int64_t *seqnum, int64_t begin, int64_t end, int timeout); // wait for an ACK
     int waitfor_dat(void *buffer, int64_t begin, int64_t end, int timeout);    // wait for a DAT
+    int waitfor_dat(void *buffer, int timeout);
+    int waitfor_ack(int64_t *seq_num_p, int timeout);
     std::map<int64_t, RtpPacket *> data_map;                                   // 存放data的map
     bool fin_received;                                                         // 是否收到了FIN包
     int64_t fin_seq;                                                           // 收到的FIN包的seq_num
 
 public:
-    Rtp(int sockfd, int window_size)
-        : sockfd(sockfd), window_size(window_size), cwnd(1.0), 
-          ssthresh(window_size), dup_ack_count(0), last_ack_seq(-1), in_fast_recovery(false) {}
+    Rtp(int sockfd)
+        : sockfd(sockfd), cwnd(1.0), 
+          ssthresh(1<<16), dup_ack_count(0), last_ack_seq(-1), in_fast_recovery(false) {}
     ~Rtp() {}
     int connect(const struct sockaddr *addr,
                 socklen_t addrlen); // connect to a remote host

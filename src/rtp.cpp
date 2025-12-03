@@ -280,7 +280,7 @@ int Rtp::connect(const struct sockaddr *addr, socklen_t addrlen)
     this->dest_addr = *(struct sockaddr_in *)addr;
     this->addrlen = addrlen;
     RtpHeader send_syn;
-    header_wrapper(&send_syn, seq_num, this->window_size, RTP_SYN);
+    header_wrapper(&send_syn, seq_num, 0, RTP_SYN);
     if (send_packet((void *)&send_syn) == -1)
     {
         LOG_DEBUG("connect send syn failed\n");
@@ -341,7 +341,7 @@ int Rtp::connect(const struct sockaddr *addr, socklen_t addrlen)
 
     // 第三次握手
     RtpHeader send_ack;
-    header_wrapper(&send_ack, seq_num, this->window_size, RTP_ACK);
+    header_wrapper(&send_ack, seq_num, 0, RTP_ACK);
     if (send_packet((void *)&send_ack) == -1)
     {
         LOG_DEBUG("connect send ack failed\n");
@@ -434,7 +434,7 @@ int Rtp::wait_connect()
     free(recv_syn);
     // 第二次握手，发送SYN&ACK
     RtpHeader send_syn_ack;
-    header_wrapper(&send_syn_ack, seq_num, this->window_size, RTP_SYN | RTP_ACK);
+    header_wrapper(&send_syn_ack, seq_num, 0, RTP_SYN | RTP_ACK);
     if (send_packet((void *)&send_syn_ack) == -1)
     {
         LOG_DEBUG("wait_connect send syn_ack failed\n");
@@ -752,6 +752,27 @@ int Rtp::waitfor_dat(void *buffer, int64_t begin, int64_t end, int timeout)
     LOG_DEBUG("waitfor_data timeout\n");
     return 0; // timeout
 }
+
+// 没有seqnum限制版的
+int Rtp::waitfor_ack(int64_t *seq_num_p, int timeout)
+{
+    RtpHeader *recv_ack = (RtpHeader *)malloc(sizeof(RtpPacket));
+    int waitfor_ret = waitfor(recv_ack, RTP_ACK, timeout);
+    if (waitfor_ret == 0)
+    {
+        *seq_num_p = seq32to64(recv_ack->seq_num);
+        free(recv_ack);
+        return 0;
+    }
+    free(recv_ack);
+    return waitfor_ret; // 1 for timeout, -1 for error
+}
+
+int Rtp::waitfor_dat(void *buffer, int timeout)
+{
+    return waitfor(buffer, RTP_DAT, timeout);
+}
+
 /* 接受文件名，发送，sr
  * 成功返回0，超时返回1，失败返回-1
  * 负责读取文件，打包放在data_map里
@@ -1050,8 +1071,8 @@ int Rtp::recv_file_sr()
         if (!recv_pkt)
             return -1;
 
-        // Wait for any data packet, not just in-window. We might need to ACK old packets.
-        int ret = waitfor_dat(recv_pkt, this->seq_num + 1, INT64_MAX, 200);
+        // Wait for any data packet
+        int ret = waitfor_dat(recv_pkt, 200);
 
         if (ret == 0) // Received a data packet
         {
@@ -1059,8 +1080,7 @@ int Rtp::recv_file_sr()
             int64_t pkt_seq = seq32to64(recv_pkt->header.seq_num);
             LOG_DEBUG("recv_file_sr: Received DAT with seq %ld. Current base is %ld.\n", pkt_seq, recv_base);
 
-            // Check if packet is within the receive window [base, base + win_size)
-            if (pkt_seq >= recv_base && pkt_seq < recv_base + this->window_size)
+            if (pkt_seq >= recv_base)
             {
                 if (this->data_map.find(pkt_seq) == this->data_map.end())
                 {
@@ -1083,8 +1103,8 @@ int Rtp::recv_file_sr()
 
             // Always send an ACK for the received packet (SR behavior)
             RtpHeader ack_pkt;
-            // 收方的可用窗口设为INT32_MAX，lab要求里并未提及需要考虑流量控制
-            uint16_t available_window = INT32_MAX;
+            // 收方的可用窗口设为UINT16_MAX，lab要求里并未提及需要考虑流量控制
+            uint16_t available_window = UINT16_MAX;
             header_wrapper(&ack_pkt, recv_pkt->header.seq_num, available_window, RTP_ACK);
             if (send_packet(&ack_pkt) == -1)
             {

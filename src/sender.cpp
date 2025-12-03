@@ -11,7 +11,6 @@ void sender_routine(char **argv)
     char *receiver_ip = argv[1];
     int port = atoi(argv[2]);
     char *file_path = argv[3];
-    int window_size = atoi(argv[4]);
     int sockfd;
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
     {
@@ -22,7 +21,7 @@ void sender_routine(char **argv)
     receiver_addr.sin_family = AF_INET;
     receiver_addr.sin_port = htons(port);
     receiver_addr.sin_addr.s_addr = inet_addr(receiver_ip);
-    Rtp rtp(sockfd, window_size);
+    Rtp rtp(sockfd);
     if (rtp.connect((struct sockaddr *)&receiver_addr, sizeof(receiver_addr))==-1)
     {
         close(sockfd);
@@ -46,10 +45,9 @@ void sender_routine(char **argv)
 
 int main(int argc, char **argv)
 {
-    if (argc != 5)
+    if (argc != 4)
     {
-        LOG_FATAL("Usage: ./sender [receiver ip] [receiver port] [file path] "
-                  "[window size]\n");
+        LOG_FATAL("Usage: ./sender [receiver ip] [receiver port] [file path]\n");
     }
 
     // your code here
