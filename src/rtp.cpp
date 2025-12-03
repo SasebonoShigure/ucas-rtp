@@ -874,19 +874,9 @@ int Rtp::recv_file(const char *filename)
     return 0;
 }
 
-#include "rtp.h"
-#include "util.h"
-// ... (您代码的其他部分，从头文件到 recv_file 函数都保持不变) ...
-
-/* 
-* 以下是您原始代码中从 send_file_sr() 开始的部分
-* 我将直接替换 send_file_sr() 和 recv_file_sr() 的实现
-* 并标注出修改。
-*/
-
 /* SR方式发送数量为total_packets的包，从data_map里取
  * 成功返回0，超时（5秒没收到任何包）返回1，失败返回-1
- * 
+ *
  * === MODIFIED: 本函数现在实现带有累积确认的滑动窗口协议 (类似GBN/TCP) ===
  * ACK为累积确认，确认收到的连续包的最大编号。
  */
@@ -903,11 +893,7 @@ int Rtp::send_file_sr(uint32_t total_packets)
     int64_t highest_seq = this->seq_num + total_packets;
     LOG_DEBUG("send_file_sr: Starting to send %u packets from seq %ld to %ld\n", total_packets, base, highest_seq);
     
-    // === MODIFIED START: 删除了 unacked_packets map ===
-    // 我们不再需要跟踪每个包的发送时间，而是只关心窗口的 base。
-    // map<int64_t, chrono::steady_clock::time_point> unacked_packets; 
     chrono::steady_clock::time_point base_send_time; // 计时器只针对base
-    // === MODIFIED END ===
 
     this->last_recv_time = chrono::steady_clock::now();             // Initialize last receive time
 
@@ -931,11 +917,9 @@ int Rtp::send_file_sr(uint32_t total_packets)
                     return -1;
                 }
                 
-                // === MODIFIED START: 更新base的发送时间 ===
                 if (next_seq_num == base) {
                     base_send_time = chrono::steady_clock::now();
                 }
-                // === MODIFIED END ===
 
                 LOG_DEBUG("send_file_sr: Sent packet %ld. cwnd=%.1f, ssthresh=%.1f\n", next_seq_num, cwnd, ssthresh);
                 next_seq_num++;
@@ -943,24 +927,54 @@ int Rtp::send_file_sr(uint32_t total_packets)
         }
         LOG_DEBUG("send_file_sr: Window [%ld, %ld), cwnd=%.1f, ssthresh=%.1f\n", base, next_seq_num, cwnd, ssthresh);
 
-        // === MODIFIED START: 超时重传逻辑修改为只检查 base ===
-        // Check for retransmission due to timeout for the base of the window
-        if (chrono::steady_clock::now() - base_send_time > chrono::milliseconds(200)) { // 200ms RTO
+        // === MODIFIED START: 超时重传逻辑修改为重传整个窗口 ===
+        // Check for retransmission due to timeout for the base of the window.
+        // On timeout, adopt a Go-Back-N strategy and retransmit all packets in the current window.
+        if (base < next_seq_num && chrono::steady_clock::now() - base_send_time > chrono::milliseconds(200)) { // 200ms RTO
+            
+            LOG_DEBUG("send_file_sr: TIMEOUT on base %ld. Retransmitting entire window [%ld, %ld).\n", base, base, next_seq_num);
+
+            // TCP Reno-style timeout reaction
+            ssthresh = max(cwnd / 2.0, 2.0);
+            cwnd = 1.0;
+            dup_ack_count = 0;
+            in_fast_recovery = false;
+            LOG_DEBUG("send_file_sr: Timeout event. ssthresh=%.1f, cwnd=%.1f\n", ssthresh, cwnd);
+
+            // Retransmit the first packet of the new, smaller window
             auto it = this->data_map.find(base);
             if (it != this->data_map.end()) {
                 if (send_packet(it->second) == -1) {
                     return -1;
                 }
-                LOG_DEBUG("send_file_sr: TIMEOUT retransmit packet %ld (base of window)\n", base);
-                base_send_time = chrono::steady_clock::now(); // Reset timer for the base
-
-                // TCP Reno-style timeout reaction
-                ssthresh = max(cwnd / 2.0, 2.0);
-                cwnd = 1.0;
-                dup_ack_count = 0;
-                in_fast_recovery = false;
-                LOG_DEBUG("send_file_sr: Timeout event. ssthresh=%.1f, cwnd=%.1f\n", ssthresh, cwnd);
+                // Reset the timer for the retransmitted base packet
+                base_send_time = chrono::steady_clock::now();
             }
+            
+            // After timeout, cwnd is 1, so we effectively only resend base.
+            // A more aggressive GBN would resend the whole old window.
+            // But shrinking cwnd to 1 first is the standard TCP approach.
+            // To make it truly GBN-like, you would iterate from base to next_seq_num here.
+            // Let's stick to the TCP-like behavior which is more robust for congestion control.
+            // The logic below is actually correct for TCP-Reno style timeout.
+            // Let's refine it to be more explicit. After a timeout, we should not immediately
+            // send more packets. We should wait for the loop to continue.
+            // The original logic of just retransmitting base and resetting the timer is correct
+            // under the TCP model, as the window size has been reset to 1.
+            
+            // To implement the GBN-style retransmission as requested:
+            LOG_DEBUG("send_file_sr: Adopting GBN-style retransmission for window [%ld, %ld).\n", base, next_seq_num);
+            for (int64_t seq_to_resend = base; seq_to_resend < next_seq_num; ++seq_to_resend) {
+                auto find_it = this->data_map.find(seq_to_resend);
+                if (find_it != this->data_map.end()) {
+                    if (send_packet(find_it->second) == -1) {
+                        return -1;
+                    }
+                    LOG_DEBUG("send_file_sr: GBN TIMEOUT retransmitting packet %ld\n", seq_to_resend);
+                }
+            }
+            // Reset the timer after retransmitting the whole window
+            base_send_time = chrono::steady_clock::now();
         }
         // === MODIFIED END ===
 
@@ -973,8 +987,6 @@ int Rtp::send_file_sr(uint32_t total_packets)
         { // Received an ACK
             this->last_recv_time = chrono::steady_clock::now();
             int64_t ack_seq = seq32to64(ack_header.seq_num);
-
-            // === MODIFIED START: ACK处理逻辑完全重写为累积确认 ===
             
             // ack_seq 是接收方已经收到的连续包的最大序号
             // 所以我们期望的下一个包是 ack_seq + 1
@@ -1039,7 +1051,6 @@ int Rtp::send_file_sr(uint32_t total_packets)
                  // ack_seq + 1 < base, 这是一个过时的ACK，忽略
                  LOG_DEBUG("send_file_sr: Received old cumulative ACK for %ld, ignoring.\n", ack_seq);
             }
-            // === MODIFIED END ===
             
             LOG_DEBUG("send_file_sr: Window base is now %ld\n", base);
         }
