@@ -31,11 +31,11 @@ extern "C"
     /* 根据文档，简便起见都采用小端法 */
     typedef struct __attribute__((__packed__)) RtpHeader
     {
-        uint32_t seq_num;           // Sequence number
-        uint16_t length;            // Length of data; 0 for SYN, ACK, and FIN packets
-        uint32_t checksum;          // 32-bit CRC
-        uint16_t advertised_window; // Receiver's available window size **FLOW CONTROL NOT IMPLEMENTED**
-        uint8_t flags;              // See at `RtpHeaderFlag`
+        uint32_t seq_num;  // Sequence number
+        uint16_t length;   // Length of data; 0 for SYN, ACK, and FIN packets
+        uint32_t checksum; // 32-bit CRC
+        // uint16_t advertised_window; // Receiver's available window size
+        uint8_t flags; // See at `RtpHeaderFlag`
     } rtp_header_t;
 
 #ifdef __cplusplus
@@ -71,21 +71,21 @@ private:
     static inline uint32_t inc_seq32(const uint32_t seq_num); // increase the sequence number
     static inline uint32_t dec_seq32(const uint32_t seq_num); // decrease the sequence number
     int waitfor(void *buffer, int flag, int timeout);         // wait for a desired packet
-    int send_file_sr(uint32_t packet_num);                    // send a file using SR
-    int recv_file_sr();                                       // receive a file using SR
+    int send_file_gbn(uint32_t packet_num);                   // send a file using gbn
+    int recv_file_gbn();                                      // receive a file using gbn
     /* 以下函数是在connect和close写完之后才加的，故在这两个函数中没有使用 */
-    int waitfor_ack(int64_t *seqnum, int64_t begin, int64_t end, int timeout); // wait for an ACK
-    int waitfor_dat(void *buffer, int64_t begin, int64_t end, int timeout);    // wait for a DAT
+    // int waitfor_ack(int64_t *seqnum, int64_t begin, int64_t end, int timeout); // wait for an ACK
+    // int waitfor_dat(void *buffer, int64_t begin, int64_t end, int timeout);    // wait for a DAT
     int waitfor_dat(void *buffer, int timeout);
     int waitfor_ack(int64_t *seq_num_p, int timeout);
-    std::map<int64_t, RtpPacket *> data_map;                                   // 存放data的map
-    bool fin_received;                                                         // 是否收到了FIN包
-    int64_t fin_seq;                                                           // 收到的FIN包的seq_num
+    std::map<int64_t, RtpPacket *> data_map; // 存放data的map
+    bool fin_received;                       // 是否收到了FIN包
+    int64_t fin_seq;                         // 收到的FIN包的seq_num
 
 public:
     Rtp(int sockfd)
-        : sockfd(sockfd), cwnd(1.0), 
-          ssthresh(1<<16), dup_ack_count(0), last_ack_seq(-1), in_fast_recovery(false) {}
+        : sockfd(sockfd), cwnd(1.0),
+          ssthresh(1 << 16), dup_ack_count(0), last_ack_seq(-1), in_fast_recovery(false) {}
     ~Rtp() {}
     int connect(const struct sockaddr *addr,
                 socklen_t addrlen); // connect to a remote host
@@ -93,11 +93,11 @@ public:
     int close();                    // close the connection
     int wait_close();               // wait for the connection to close
     static void packet_wrapper(RtpPacket *pkt, uint32_t seq_num,
-                               uint16_t length, uint16_t advertised_window, void *payload); // wrap a packet
+                               uint16_t length, /*uint16_t advertised_window,*/ void *payload); // wrap a packet
     static void header_wrapper(RtpHeader *header,
-                               uint32_t seq_num, uint16_t advertised_window, uint8_t flags); // wrap a header
-    int send_file(const char *filename);                                                     // send a file
-    int recv_file(const char *filename);                                                     // receive a file
+                               uint32_t seq_num, /*uint16_t advertised_window,*/ uint8_t flags); // wrap a header
+    int send_file(const char *filename);                                                         // send a file
+    int recv_file(const char *filename);                                                         // receive a file
 };
 
 #endif // __RTP_H

@@ -37,7 +37,7 @@ void sender_routine(char **argv)
     if (rtp.close() == -1)
     {
         close(sockfd);
-        LOG_FATAL("sender_routine close failed\n");
+        LOG_DEBUG("sender_routine close failed\n"); // 不影响
         return;
     }
     close(sockfd);

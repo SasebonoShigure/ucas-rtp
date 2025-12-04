@@ -59,7 +59,6 @@ int main(int argc, char **argv)
     {
         LOG_FATAL("Usage: ./receiver [listen port] [file path]\n");
     }
-    // your code here
     receiver_routine(argv);
 
     LOG_DEBUG("Receiver: exiting...\n");
